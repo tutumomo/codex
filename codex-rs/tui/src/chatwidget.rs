@@ -52,6 +52,16 @@ use crate::bottom_pane::StatusLinePreviewData;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::legacy_core::DEFAULT_PROJECT_DOC_FILENAME;
+use crate::legacy_core::config::Config;
+use crate::legacy_core::config::Constrained;
+use crate::legacy_core::config::ConstraintResult;
+use crate::legacy_core::config_loader::ConfigLayerStackOrdering;
+use crate::legacy_core::find_thread_name_by_id;
+use crate::legacy_core::plugins::PluginsManager;
+use crate::legacy_core::skills::model::SkillMetadata;
+#[cfg(target_os = "windows")]
+use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
@@ -95,16 +105,6 @@ use codex_chatgpt::connectors;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
-use codex_core::DEFAULT_PROJECT_DOC_FILENAME;
-use codex_core::config::Config;
-use codex_core::config::Constrained;
-use codex_core::config::ConstraintResult;
-use codex_core::config_loader::ConfigLayerStackOrdering;
-use codex_core::find_thread_name_by_id;
-use codex_core::plugins::PluginsManager;
-use codex_core::skills::model::SkillMetadata;
-#[cfg(target_os = "windows")]
-use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_features::FEATURES;
 use codex_features::Feature;
 #[cfg(test)]
@@ -854,6 +854,7 @@ pub(crate) struct ChatWidget {
     pending_status_indicator_restore: bool,
     suppress_queue_autosend: bool,
     thread_id: Option<ThreadId>,
+    last_turn_id: Option<String>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
     frame_requester: FrameRequester,
@@ -1961,6 +1962,7 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
+        self.last_turn_id = None;
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
@@ -2143,6 +2145,7 @@ impl ChatWidget {
     ) {
         let view = crate::bottom_pane::FeedbackNoteView::new(
             category,
+            self.last_turn_id.clone(),
             self.app_event_tx.clone(),
             include_logs,
         );
@@ -4827,6 +4830,7 @@ impl ChatWidget {
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
             thread_id: None,
+            last_turn_id: None,
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
@@ -4893,7 +4897,7 @@ impl ChatWidget {
             .set_queued_message_edit_binding(widget.queued_message_edit_binding);
         #[cfg(target_os = "windows")]
         widget.bottom_pane.set_windows_degraded_sandbox_active(
-            codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+            crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
                 && matches!(
                     WindowsSandboxLevel::from_config(&widget.config),
                     WindowsSandboxLevel::RestrictedToken
@@ -5330,7 +5334,7 @@ impl ChatWidget {
                     let windows_degraded_sandbox_enabled =
                         matches!(windows_sandbox_level, WindowsSandboxLevel::RestrictedToken);
                     if !windows_degraded_sandbox_enabled
-                        || !codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+                        || !crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
                     {
                         // This command should not be visible/recognized outside degraded mode,
                         // but guard anyway in case something dispatches it directly.
@@ -5573,7 +5577,8 @@ impl ChatWidget {
                 else {
                     return;
                 };
-                let Some(name) = codex_core::util::normalize_thread_name(&prepared_args) else {
+                let Some(name) = crate::legacy_core::util::normalize_thread_name(&prepared_args)
+                else {
                     self.add_error_message("Thread name cannot be empty.".to_string());
                     return;
                 };
@@ -5670,7 +5675,7 @@ impl ChatWidget {
             "Type a name and press Enter".to_string(),
             /*context_label*/ None,
             Box::new(move |name: String| {
-                let Some(name) = codex_core::util::normalize_thread_name(&name) else {
+                let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) else {
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_error_event("Thread name cannot be empty.".to_string()),
                     )));
@@ -5904,7 +5909,7 @@ impl ChatWidget {
 
             let app_mentions = find_app_mentions(&mentions, apps, &skill_names_lower);
             for app in app_mentions {
-                let slug = codex_core::connectors::connector_mention_slug(&app);
+                let slug = crate::legacy_core::connectors::connector_mention_slug(&app);
                 if bound_names.contains(&slug) || !selected_app_ids.insert(app.id.clone()) {
                     continue;
                 }
@@ -6500,7 +6505,8 @@ impl ChatWidget {
                     }
                 }
             }
-            ServerNotification::TurnStarted(_) => {
+            ServerNotification::TurnStarted(notification) => {
+                self.last_turn_id = Some(notification.turn.id);
                 self.last_non_retry_error = None;
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
                     self.on_task_started();
@@ -6914,6 +6920,9 @@ impl ChatWidget {
                 codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
                     GuardianAssessmentStatus::Denied
                 }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => {
+                    GuardianAssessmentStatus::TimedOut
+                }
                 codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
                     GuardianAssessmentStatus::Aborted
                 }
@@ -7068,8 +7077,11 @@ impl ChatWidget {
             }
             EventMsg::AgentReasoningSectionBreak(_) => self.on_reasoning_section_break(),
             EventMsg::TurnStarted(event) => {
+                let turn_id = event.turn_id;
+                let model_context_window = event.model_context_window;
+                self.last_turn_id = Some(turn_id);
                 if !is_resume_initial_replay {
-                    self.apply_turn_started_context_window(event.model_context_window);
+                    self.apply_turn_started_context_window(model_context_window);
                     self.on_task_started();
                 }
             }
@@ -7337,16 +7349,17 @@ impl ChatWidget {
 
     #[cfg(test)]
     fn on_entered_review_mode(&mut self, review: ReviewRequest, from_replay: bool) {
-        let hint = review
-            .user_facing_hint
-            .unwrap_or_else(|| codex_core::review_prompts::user_facing_hint(&review.target));
+        let hint = review.user_facing_hint.unwrap_or_else(|| {
+            crate::legacy_core::review_prompts::user_facing_hint(&review.target)
+        });
         self.enter_review_mode_with_hint(hint, from_replay);
     }
 
     #[cfg(test)]
     fn on_exited_review_mode(&mut self, review: ExitedReviewModeEvent) {
         if let Some(output) = review.review_output {
-            let review_markdown = codex_core::review_format::render_review_output_text(&output);
+            let review_markdown =
+                crate::legacy_core::review_format::render_review_output_text(&output);
             self.record_agent_markdown(&review_markdown);
             self.flush_answer_stream_with_separator();
             self.flush_interrupt_queue();
@@ -7620,7 +7633,7 @@ impl ChatWidget {
     }
 
     fn open_theme_picker(&mut self) {
-        let codex_home = codex_core::config::find_codex_home().ok();
+        let codex_home = crate::legacy_core::config::find_codex_home().ok();
         let terminal_width = self
             .last_rendered_width
             .get()
@@ -8738,9 +8751,10 @@ impl ChatWidget {
         #[cfg(not(target_os = "windows"))]
         let windows_degraded_sandbox_enabled = false;
 
-        let show_elevate_sandbox_hint = codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
-            && windows_degraded_sandbox_enabled
-            && presets.iter().any(|preset| preset.id == "auto");
+        let show_elevate_sandbox_hint =
+            crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+                && windows_degraded_sandbox_enabled
+                && presets.iter().any(|preset| preset.id == "auto");
 
         let guardian_disabled_reason = |enabled: bool| {
             let mut next_features = self.config.features.get().clone();
@@ -8796,8 +8810,8 @@ impl ChatWidget {
                         == WindowsSandboxLevel::Disabled
                     {
                         let preset_clone = preset.clone();
-                        if codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
-                            && codex_core::windows_sandbox::sandbox_setup_is_complete(
+                        if crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+                            && crate::legacy_core::windows_sandbox::sandbox_setup_is_complete(
                                 self.config.codex_home.as_path(),
                             )
                         {
@@ -9253,7 +9267,7 @@ impl ChatWidget {
     pub(crate) fn open_windows_sandbox_enable_prompt(&mut self, preset: ApprovalPreset) {
         use ratatui_macros::line;
 
-        if !codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED {
+        if !crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED {
             // Legacy flow (pre-NUX): explain the experimental sandbox and let the user enable it
             // directly (no elevation prompts).
             let mut header = ColumnRenderable::new();
@@ -9539,7 +9553,7 @@ impl ChatWidget {
         self.config.permissions.windows_sandbox_mode = mode;
         #[cfg(target_os = "windows")]
         self.bottom_pane.set_windows_degraded_sandbox_active(
-            codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+            crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
                 && matches!(
                     WindowsSandboxLevel::from_config(&self.config),
                     WindowsSandboxLevel::RestrictedToken
@@ -9590,7 +9604,7 @@ impl ChatWidget {
             Feature::WindowsSandbox | Feature::WindowsSandboxElevated
         ) {
             self.bottom_pane.set_windows_degraded_sandbox_active(
-                codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
+                crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
                     && matches!(
                         WindowsSandboxLevel::from_config(&self.config),
                         WindowsSandboxLevel::RestrictedToken
@@ -10092,7 +10106,9 @@ impl ChatWidget {
         }
     }
 
-    fn plugins_for_mentions(&self) -> Option<&[codex_core::plugins::PluginCapabilitySummary]> {
+    fn plugins_for_mentions(
+        &self,
+    ) -> Option<&[crate::legacy_core::plugins::PluginCapabilitySummary]> {
         if !self.config.features.enabled(Feature::Plugins) {
             return None;
         }
@@ -10162,7 +10178,7 @@ impl ChatWidget {
     }
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
-        let resume_cmd = codex_core::util::resume_command(Some(name), thread_id)
+        let resume_cmd = crate::legacy_core::util::resume_command(Some(name), thread_id)
             .unwrap_or_else(|| format!("codex resume {name}"));
         let name = name.to_string();
         let line = vec![
