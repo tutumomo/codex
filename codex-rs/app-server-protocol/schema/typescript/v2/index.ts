@@ -149,6 +149,8 @@ export type { ListMcpServerStatusResponse } from "./ListMcpServerStatusResponse"
 export type { LoginAccountParams } from "./LoginAccountParams";
 export type { LoginAccountResponse } from "./LoginAccountResponse";
 export type { LogoutAccountResponse } from "./LogoutAccountResponse";
+export type { MarketplaceAddParams } from "./MarketplaceAddParams";
+export type { MarketplaceAddResponse } from "./MarketplaceAddResponse";
 export type { MarketplaceInterface } from "./MarketplaceInterface";
 export type { MarketplaceLoadErrorInfo } from "./MarketplaceLoadErrorInfo";
 export type { McpAuthStatus } from "./McpAuthStatus";
@@ -303,7 +305,8 @@ export type { ThreadRealtimeOutputAudioDeltaNotification } from "./ThreadRealtim
 export type { ThreadRealtimeSdpNotification } from "./ThreadRealtimeSdpNotification";
 export type { ThreadRealtimeStartTransport } from "./ThreadRealtimeStartTransport";
 export type { ThreadRealtimeStartedNotification } from "./ThreadRealtimeStartedNotification";
-export type { ThreadRealtimeTranscriptUpdatedNotification } from "./ThreadRealtimeTranscriptUpdatedNotification";
+export type { ThreadRealtimeTranscriptDeltaNotification } from "./ThreadRealtimeTranscriptDeltaNotification";
+export type { ThreadRealtimeTranscriptDoneNotification } from "./ThreadRealtimeTranscriptDoneNotification";
 export type { ThreadResumeParams } from "./ThreadResumeParams";
 export type { ThreadResumeResponse } from "./ThreadResumeResponse";
 export type { ThreadRollbackParams } from "./ThreadRollbackParams";

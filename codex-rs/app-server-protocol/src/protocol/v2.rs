@@ -74,6 +74,7 @@ use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
 use codex_protocol::protocol::RealtimeAudioFrame as CoreRealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationVersion;
+use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
@@ -3329,6 +3330,26 @@ pub struct SkillsListResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct MarketplaceAddParams {
+    pub source: String,
+    #[ts(optional = nullable)]
+    pub ref_name: Option<String>,
+    #[ts(optional = nullable)]
+    pub sparse_paths: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MarketplaceAddResponse {
+    pub marketplace_name: String,
+    pub installed_root: AbsolutePathBuf,
+    pub already_added: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct PluginListParams {
     /// Optional working directories used to discover repo marketplaces. When omitted,
     /// only home-scoped marketplaces and the official curated marketplace are considered.
@@ -3956,11 +3977,14 @@ impl From<ThreadRealtimeAudioChunk> for CoreRealtimeAudioFrame {
 }
 
 /// EXPERIMENTAL - start a thread-scoped realtime session.
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadRealtimeStartParams {
     pub thread_id: String,
+    /// Selects text or audio output for the realtime session. Transport and voice stay
+    /// independent so clients can choose how they connect separately from what the model emits.
+    pub output_modality: RealtimeOutputModality,
     #[serde(
         default,
         deserialize_with = "super::serde_helpers::deserialize_double_option",
@@ -4078,9 +4102,22 @@ pub struct ThreadRealtimeItemAddedNotification {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadRealtimeTranscriptUpdatedNotification {
+pub struct ThreadRealtimeTranscriptDeltaNotification {
     pub thread_id: String,
     pub role: String,
+    /// Live transcript delta from the realtime event.
+    pub delta: String,
+}
+
+/// EXPERIMENTAL - final transcript text emitted when realtime completes
+/// a transcript part.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeTranscriptDoneNotification {
+    pub thread_id: String,
+    pub role: String,
+    /// Final complete text for the transcript part.
     pub text: String,
 }
 
@@ -8348,6 +8385,37 @@ mod tests {
             json!({
                 "cwds": null,
                 "forceRemoteSync": true,
+            }),
+        );
+    }
+
+    #[test]
+    fn marketplace_add_params_serialization_uses_optional_ref_name_and_sparse_paths() {
+        assert_eq!(
+            serde_json::to_value(MarketplaceAddParams {
+                source: "owner/repo".to_string(),
+                ref_name: None,
+                sparse_paths: None,
+            })
+            .unwrap(),
+            json!({
+                "source": "owner/repo",
+                "refName": null,
+                "sparsePaths": null,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(MarketplaceAddParams {
+                source: "owner/repo".to_string(),
+                ref_name: Some("main".to_string()),
+                sparse_paths: Some(vec!["plugins/foo".to_string()]),
+            })
+            .unwrap(),
+            json!({
+                "source": "owner/repo",
+                "refName": "main",
+                "sparsePaths": ["plugins/foo"],
             }),
         );
     }

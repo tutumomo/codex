@@ -22,6 +22,9 @@ use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::AnalyticsJsonRpcError;
+use codex_analytics::InputError;
+use codex_analytics::TurnSteerRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
@@ -36,7 +39,7 @@ use codex_app_server_protocol::CancelLoginAccountResponse;
 use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponse;
-use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
+use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CollaborationModeListParams;
 use codex_app_server_protocol::CollaborationModeListResponse;
 use codex_app_server_protocol::CommandExecParams;
@@ -76,6 +79,8 @@ use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LoginApiKeyParams;
 use codex_app_server_protocol::LogoutAccountResponse;
+use codex_app_server_protocol::MarketplaceAddParams;
+use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceInterface;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpResourceReadResponse;
@@ -228,6 +233,7 @@ use codex_core::find_thread_names_by_ids;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::parse_cursor;
 use codex_core::path_utils;
+use codex_core::plugins::MarketplaceAddError;
 use codex_core::plugins::MarketplaceError;
 use codex_core::plugins::MarketplacePluginSource;
 use codex_core::plugins::OPENAI_CURATED_MARKETPLACE_NAME;
@@ -235,6 +241,7 @@ use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
+use codex_core::plugins::add_marketplace as add_marketplace_to_codex_home;
 use codex_core::plugins::load_plugin_apps;
 use codex_core::plugins::load_plugin_mcp_servers;
 use codex_core::read_head_for_summary;
@@ -638,6 +645,22 @@ impl CodexMessageProcessor {
         }
     }
 
+    fn track_error_response(
+        &self,
+        request_id: &ConnectionRequestId,
+        error: &JSONRPCErrorError,
+        error_type: Option<AnalyticsJsonRpcError>,
+    ) {
+        if self.config.features.enabled(Feature::GeneralAnalytics) {
+            self.analytics_events_client.track_error_response(
+                request_id.connection_id.0,
+                request_id.request_id.clone(),
+                error.clone(),
+                error_type,
+            );
+        }
+    }
+
     async fn load_thread(
         &self,
         thread_id: &str,
@@ -925,6 +948,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::SkillsList { request_id, params } => {
                 self.skills_list(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MarketplaceAdd { request_id, params } => {
+                self.marketplace_add(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::PluginList { request_id, params } => {
@@ -5320,7 +5347,11 @@ impl CodexMessageProcessor {
         &self,
         config: &Config,
     ) -> Result<(), JSONRPCErrorError> {
-        let configured_servers = self.thread_manager.mcp_manager().configured_servers(config);
+        let configured_servers = self
+            .thread_manager
+            .mcp_manager()
+            .configured_servers(config)
+            .await;
         let mcp_servers = match serde_json::to_value(configured_servers) {
             Ok(value) => value,
             Err(err) => {
@@ -5380,7 +5411,8 @@ impl CodexMessageProcessor {
         let configured_servers = self
             .thread_manager
             .mcp_manager()
-            .configured_servers(&config);
+            .configured_servers(&config)
+            .await;
         let Some(server) = configured_servers.get(&name) else {
             let error = JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
@@ -5482,7 +5514,9 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        let mcp_config = config.to_mcp_config(self.thread_manager.plugins_manager().as_ref());
+        let mcp_config = config
+            .to_mcp_config(self.thread_manager.plugins_manager().as_ref())
+            .await;
         let auth = self.auth_manager.auth().await;
 
         tokio::spawn(async move {
@@ -6307,10 +6341,12 @@ impl CodexMessageProcessor {
                     continue;
                 }
             };
-            let effective_skill_roots = plugins_manager.effective_skill_roots_for_layer_stack(
-                &config_layer_stack,
-                config.features.enabled(Feature::Plugins),
-            );
+            let effective_skill_roots = plugins_manager
+                .effective_skill_roots_for_layer_stack(
+                    &config_layer_stack,
+                    config.features.enabled(Feature::Plugins),
+                )
+                .await;
             let skills_input = codex_core::skills::SkillsLoadInput::new(
                 cwd_abs,
                 effective_skill_roots,
@@ -6483,6 +6519,39 @@ impl CodexMessageProcessor {
             .await;
     }
 
+    async fn marketplace_add(&self, request_id: ConnectionRequestId, params: MarketplaceAddParams) {
+        let result = add_marketplace_to_codex_home(
+            self.config.codex_home.to_path_buf(),
+            codex_core::plugins::MarketplaceAddRequest {
+                source: params.source,
+                ref_name: params.ref_name,
+                sparse_paths: params.sparse_paths.unwrap_or_default(),
+            },
+        )
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        MarketplaceAddResponse {
+                            marketplace_name: outcome.marketplace_name,
+                            installed_root: outcome.installed_root,
+                            already_added: outcome.already_added,
+                        },
+                    )
+                    .await;
+            }
+            Err(MarketplaceAddError::InvalidRequest(message)) => {
+                self.send_invalid_request_error(request_id, message).await;
+            }
+            Err(MarketplaceAddError::Internal(message)) => {
+                self.send_internal_error(request_id, message).await;
+            }
+        }
+    }
+
     async fn plugin_read(&self, request_id: ConnectionRequestId, params: PluginReadParams) {
         let plugins_manager = self.thread_manager.plugins_manager();
         let PluginReadParams {
@@ -6503,24 +6572,14 @@ impl CodexMessageProcessor {
             plugin_name,
             marketplace_path,
         };
-        let config_for_read = config.clone();
-        let outcome = match tokio::task::spawn_blocking(move || {
-            plugins_manager.read_plugin_for_config(&config_for_read, &request)
-        })
-        .await
+        let outcome = match plugins_manager
+            .read_plugin_for_config(&config, &request)
+            .await
         {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(err)) => {
+            Ok(outcome) => outcome,
+            Err(err) => {
                 self.send_marketplace_error(request_id, err, "read plugin details")
                     .await;
-                return;
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!("failed to read plugin details: {err}"),
-                )
-                .await;
                 return;
             }
         };
@@ -6663,7 +6722,8 @@ impl CodexMessageProcessor {
 
                 self.clear_plugin_related_caches();
 
-                let plugin_mcp_servers = load_plugin_mcp_servers(result.installed_path.as_path());
+                let plugin_mcp_servers =
+                    load_plugin_mcp_servers(result.installed_path.as_path()).await;
 
                 if !plugin_mcp_servers.is_empty() {
                     if let Err(err) = self.queue_mcp_server_refresh_for_config(&config).await {
@@ -6676,7 +6736,7 @@ impl CodexMessageProcessor {
                         .await;
                 }
 
-                let plugin_apps = load_plugin_apps(result.installed_path.as_path());
+                let plugin_apps = load_plugin_apps(result.installed_path.as_path()).await;
                 let auth = self.auth_manager.auth().await;
                 let apps_needing_auth = if plugin_apps.is_empty()
                     || !config.features.apps_enabled_for_auth(
@@ -6879,12 +6939,18 @@ impl CodexMessageProcessor {
         app_server_client_version: Option<String>,
     ) {
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
+            self.track_error_response(
+                &request_id,
+                &error,
+                Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
+            );
             self.outgoing.send_error(request_id, error).await;
             return;
         }
         let (_, thread) = match self.load_thread(&params.thread_id).await {
             Ok(v) => v,
             Err(error) => {
+                self.track_error_response(&request_id, &error, /*error_type*/ None);
                 self.outgoing.send_error(request_id, error).await;
                 return;
             }
@@ -6896,6 +6962,7 @@ impl CodexMessageProcessor {
         )
         .await
         {
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
             self.outgoing.send_error(request_id, error).await;
             return;
         }
@@ -6979,6 +7046,15 @@ impl CodexMessageProcessor {
                 };
 
                 let response = TurnStartResponse { turn };
+                if self.config.features.enabled(Feature::GeneralAnalytics) {
+                    self.analytics_events_client.track_response(
+                        request_id.connection_id.0,
+                        ClientResponse::TurnStart {
+                            request_id: request_id.request_id.clone(),
+                            response: response.clone(),
+                        },
+                    );
+                }
                 self.outgoing.send_response(request_id, response).await;
             }
             Err(err) => {
@@ -6987,6 +7063,7 @@ impl CodexMessageProcessor {
                     message: format!("failed to start turn: {err}"),
                     data: None,
                 };
+                self.track_error_response(&request_id, &error, /*error_type*/ None);
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -7060,6 +7137,7 @@ impl CodexMessageProcessor {
         let (_, thread) = match self.load_thread(&params.thread_id).await {
             Ok(v) => v,
             Err(error) => {
+                self.track_error_response(&request_id, &error, /*error_type*/ None);
                 self.outgoing.send_error(request_id, error).await;
                 return;
             }
@@ -7077,6 +7155,11 @@ impl CodexMessageProcessor {
             .record_request_turn_id(&request_id, &params.expected_turn_id)
             .await;
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
+            self.track_error_response(
+                &request_id,
+                &error,
+                Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
+            );
             self.outgoing.send_error(request_id, error).await;
             return;
         }
@@ -7097,36 +7180,51 @@ impl CodexMessageProcessor {
         {
             Ok(turn_id) => {
                 let response = TurnSteerResponse { turn_id };
+                if self.config.features.enabled(Feature::GeneralAnalytics) {
+                    self.analytics_events_client.track_response(
+                        request_id.connection_id.0,
+                        ClientResponse::TurnSteer {
+                            request_id: request_id.request_id.clone(),
+                            response: response.clone(),
+                        },
+                    );
+                }
                 self.outgoing.send_response(request_id, response).await;
             }
             Err(err) => {
-                let (code, message, data) = match err {
+                let (code, message, data, error_type) = match err {
                     SteerInputError::NoActiveTurn(_) => (
                         INVALID_REQUEST_ERROR_CODE,
                         "no active turn to steer".to_string(),
                         None,
+                        Some(AnalyticsJsonRpcError::TurnSteer(
+                            TurnSteerRequestError::NoActiveTurn,
+                        )),
                     ),
                     SteerInputError::ExpectedTurnMismatch { expected, actual } => (
                         INVALID_REQUEST_ERROR_CODE,
                         format!("expected active turn id `{expected}` but found `{actual}`"),
                         None,
+                        Some(AnalyticsJsonRpcError::TurnSteer(
+                            TurnSteerRequestError::ExpectedTurnMismatch,
+                        )),
                     ),
                     SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
-                        let message = match turn_kind {
-                            codex_protocol::protocol::NonSteerableTurnKind::Review => {
-                                "cannot steer a review turn".to_string()
-                            }
-                            codex_protocol::protocol::NonSteerableTurnKind::Compact => {
-                                "cannot steer a compact turn".to_string()
-                            }
+                        let (message, turn_steer_error) = match turn_kind {
+                            codex_protocol::protocol::NonSteerableTurnKind::Review => (
+                                "cannot steer a review turn".to_string(),
+                                TurnSteerRequestError::NonSteerableReview,
+                            ),
+                            codex_protocol::protocol::NonSteerableTurnKind::Compact => (
+                                "cannot steer a compact turn".to_string(),
+                                TurnSteerRequestError::NonSteerableCompact,
+                            ),
                         };
                         let error = TurnError {
                             message: message.clone(),
-                            codex_error_info: Some(
-                                AppServerCodexErrorInfo::ActiveTurnNotSteerable {
-                                    turn_kind: turn_kind.into(),
-                                },
-                            ),
+                            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                                turn_kind: turn_kind.into(),
+                            }),
                             additional_details: None,
                         };
                         let data = match serde_json::to_value(error) {
@@ -7139,12 +7237,18 @@ impl CodexMessageProcessor {
                                 None
                             }
                         };
-                        (INVALID_REQUEST_ERROR_CODE, message, data)
+                        (
+                            INVALID_REQUEST_ERROR_CODE,
+                            message,
+                            data,
+                            Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
+                        )
                     }
                     SteerInputError::EmptyInput => (
                         INVALID_REQUEST_ERROR_CODE,
                         "input must not be empty".to_string(),
                         None,
+                        Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
                     ),
                 };
                 let error = JSONRPCErrorError {
@@ -7152,6 +7256,7 @@ impl CodexMessageProcessor {
                     message,
                     data,
                 };
+                self.track_error_response(&request_id, &error, error_type);
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -7218,6 +7323,7 @@ impl CodexMessageProcessor {
                 &request_id,
                 thread.as_ref(),
                 Op::RealtimeConversationStart(ConversationStartParams {
+                    output_modality: params.output_modality,
                     prompt: params.prompt,
                     session_id: params.session_id,
                     transport: params.transport.map(|transport| match transport {
@@ -7899,6 +8005,9 @@ impl CodexMessageProcessor {
                             conversation_id,
                             conversation.clone(),
                             thread_manager.clone(),
+                            listener_task_context
+                                .general_analytics_enabled
+                                .then(|| listener_task_context.analytics_events_client.clone()),
                             thread_outgoing,
                             thread_state.clone(),
                             thread_watch_manager.clone(),
