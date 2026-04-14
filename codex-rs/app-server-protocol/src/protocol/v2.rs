@@ -2320,10 +2320,12 @@ pub struct FsGetMetadataParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct FsGetMetadataResponse {
-    /// Whether the path currently resolves to a directory.
+    /// Whether the path resolves to a directory.
     pub is_directory: bool,
-    /// Whether the path currently resolves to a regular file.
+    /// Whether the path resolves to a regular file.
     pub is_file: bool,
+    /// Whether the path itself is a symbolic link.
+    pub is_symlink: bool,
     /// File creation time in Unix milliseconds when available, otherwise `0`.
     #[ts(type = "number")]
     pub created_at_ms: i64,
@@ -3049,6 +3051,43 @@ pub struct ThreadMetadataUpdateResponse {
     pub thread: Thread,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase")]
+pub enum ThreadMemoryMode {
+    Enabled,
+    Disabled,
+}
+
+impl ThreadMemoryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn to_core(self) -> codex_protocol::protocol::ThreadMemoryMode {
+        match self {
+            Self::Enabled => codex_protocol::protocol::ThreadMemoryMode::Enabled,
+            Self::Disabled => codex_protocol::protocol::ThreadMemoryMode::Disabled,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadMemoryModeSetParams {
+    pub thread_id: String,
+    pub mode: ThreadMemoryMode,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadMemoryModeSetResponse {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -3363,7 +3402,7 @@ pub struct SkillMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub dependencies: Option<SkillDependencies>,
-    pub path: PathBuf,
+    pub path: AbsolutePathBuf,
     pub scope: SkillScope,
     pub enabled: bool,
 }
@@ -3509,7 +3548,7 @@ pub struct SkillSummary {
     pub description: String,
     pub short_description: Option<String>,
     pub interface: Option<SkillInterface>,
-    pub path: PathBuf,
+    pub path: AbsolutePathBuf,
     pub enabled: bool,
 }
 
@@ -4213,6 +4252,20 @@ pub enum ReviewTarget {
 pub struct TurnStartResponse {
     pub turn: Turn,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadInjectItemsParams {
+    pub thread_id: String,
+    /// Raw Responses API items to append to the thread's model-visible history.
+    pub items: Vec<JsonValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadInjectItemsResponse {}
 
 #[derive(
     Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
@@ -6714,6 +6767,7 @@ mod tests {
         let response = FsGetMetadataResponse {
             is_directory: false,
             is_file: true,
+            is_symlink: false,
             created_at_ms: 123,
             modified_at_ms: 456,
         };
@@ -6724,6 +6778,7 @@ mod tests {
             json!({
                 "isDirectory": false,
                 "isFile": true,
+                "isSymlink": false,
                 "createdAtMs": 123,
                 "modifiedAtMs": 456,
             })
