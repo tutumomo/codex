@@ -5,6 +5,9 @@
 //! the main event loop remains single-threaded.
 
 use super::*;
+use codex_app_server_protocol::MarketplaceAddParams;
+use codex_app_server_protocol::MarketplaceAddResponse;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 impl App {
     pub(super) fn fetch_mcp_inventory(
@@ -102,6 +105,28 @@ impl App {
                 .await
                 .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::PluginDetailLoaded { cwd, result });
+        });
+    }
+
+    pub(super) fn fetch_marketplace_add(
+        &mut self,
+        app_server: &AppServerSession,
+        cwd: PathBuf,
+        source: String,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let cwd_for_event = cwd.clone();
+            let source_for_event = source.clone();
+            let result = fetch_marketplace_add(request_handle, cwd, source)
+                .await
+                .map_err(|err| format!("Failed to add marketplace: {err}"));
+            app_event_tx.send(AppEvent::MarketplaceAddLoaded {
+                cwd: cwd_for_event,
+                source: source_for_event,
+                result,
+            });
         });
     }
 
@@ -509,6 +534,54 @@ pub(super) async fn fetch_plugin_detail(
         .wrap_err("plugin/read failed in TUI")
 }
 
+pub(super) async fn fetch_marketplace_add(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+    source: String,
+) -> Result<MarketplaceAddResponse> {
+    let cwd = AbsolutePathBuf::try_from(cwd).wrap_err("marketplace/add cwd must be absolute")?;
+    let source = marketplace_add_source_for_request(cwd.as_path(), source);
+    let request_id = RequestId::String(format!("marketplace-add-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::MarketplaceAdd {
+            request_id,
+            params: MarketplaceAddParams {
+                source,
+                ref_name: None,
+                sparse_paths: None,
+            },
+        })
+        .await
+        .wrap_err("marketplace/add failed in TUI")
+}
+
+fn marketplace_add_source_for_request(cwd: &std::path::Path, source: String) -> String {
+    let (base_source, suffix) = if let Some((base, ref_name)) = source.rsplit_once('#') {
+        (base, Some(format!("#{ref_name}")))
+    } else if let Some((base, ref_name)) = source.rsplit_once('@') {
+        (base, Some(format!("@{ref_name}")))
+    } else {
+        (source.as_str(), None)
+    };
+
+    if matches!(base_source, "." | "..")
+        || base_source.starts_with("./")
+        || base_source.starts_with("../")
+        || base_source.starts_with(".\\")
+        || base_source.starts_with("..\\")
+    {
+        let mut resolved = AbsolutePathBuf::resolve_path_against_base(base_source, cwd)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(suffix) = suffix {
+            resolved.push_str(&suffix);
+        }
+        return resolved;
+    }
+
+    source
+}
+
 pub(super) async fn fetch_plugin_install(
     request_handle: AppServerRequestHandle,
     marketplace_path: AbsolutePathBuf,
@@ -636,4 +709,174 @@ pub(super) fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -
     }
 
     (tools, resources, resource_templates, auth_statuses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_app_server_protocol::PluginMarketplaceEntry;
+    use codex_protocol::mcp::Tool;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
+
+    fn test_absolute_path(path: &str) -> AbsolutePathBuf {
+        AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
+    }
+
+    #[test]
+    fn marketplace_add_source_for_request_resolves_relative_local_paths() {
+        let cwd = if cfg!(windows) {
+            PathBuf::from(r"C:\workspace\project")
+        } else {
+            PathBuf::from("/workspace/project")
+        };
+
+        let resolved = marketplace_add_source_for_request(&cwd, "./marketplace".to_string());
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(resolved, cwd.join("marketplace").display().to_string());
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "./marketplace#main".to_string()),
+            format!("{}#main", cwd.join("marketplace").display())
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "owner/repo".to_string()),
+            "owner/repo"
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "~/marketplace".to_string()),
+            "~/marketplace"
+        );
+    }
+
+    #[test]
+    fn hide_cli_only_plugin_marketplaces_removes_openai_bundled() {
+        let mut response = PluginListResponse {
+            marketplaces: vec![
+                PluginMarketplaceEntry {
+                    name: "openai-bundled".to_string(),
+                    path: Some(test_absolute_path("/marketplaces/openai-bundled")),
+                    interface: None,
+                    plugins: Vec::new(),
+                },
+                PluginMarketplaceEntry {
+                    name: "openai-curated".to_string(),
+                    path: Some(test_absolute_path("/marketplaces/openai-curated")),
+                    interface: None,
+                    plugins: Vec::new(),
+                },
+            ],
+            marketplace_load_errors: Vec::new(),
+            featured_plugin_ids: Vec::new(),
+        };
+
+        hide_cli_only_plugin_marketplaces(&mut response);
+
+        assert_eq!(
+            response.marketplaces,
+            vec![PluginMarketplaceEntry {
+                name: "openai-curated".to_string(),
+                path: Some(test_absolute_path("/marketplaces/openai-curated")),
+                interface: None,
+                plugins: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn mcp_inventory_maps_prefix_tool_names_by_server() {
+        let statuses = vec![
+            McpServerStatus {
+                name: "docs".to_string(),
+                tools: HashMap::from([(
+                    "list".to_string(),
+                    Tool {
+                        description: None,
+                        name: "list".to_string(),
+                        title: None,
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: None,
+                        annotations: None,
+                        icons: None,
+                        meta: None,
+                    },
+                )]),
+                resources: Vec::new(),
+                resource_templates: Vec::new(),
+                auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
+            },
+            McpServerStatus {
+                name: "disabled".to_string(),
+                tools: HashMap::new(),
+                resources: Vec::new(),
+                resource_templates: Vec::new(),
+                auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
+            },
+        ];
+
+        let (tools, resources, resource_templates, auth_statuses) =
+            mcp_inventory_maps_from_statuses(statuses);
+        let mut resource_names = resources.keys().cloned().collect::<Vec<_>>();
+        resource_names.sort();
+        let mut template_names = resource_templates.keys().cloned().collect::<Vec<_>>();
+        template_names.sort();
+
+        assert_eq!(
+            tools.keys().cloned().collect::<Vec<_>>(),
+            vec!["mcp__docs__list".to_string()]
+        );
+        assert_eq!(resource_names, vec!["disabled", "docs"]);
+        assert_eq!(template_names, vec!["disabled", "docs"]);
+        assert_eq!(
+            auth_statuses.get("disabled"),
+            Some(&McpAuthStatus::Unsupported)
+        );
+    }
+
+    #[test]
+    fn build_feedback_upload_params_includes_thread_id_and_rollout_path() {
+        let thread_id = ThreadId::new();
+        let rollout_path = PathBuf::from("/tmp/rollout.jsonl");
+
+        let params = build_feedback_upload_params(
+            Some(thread_id),
+            Some(rollout_path.clone()),
+            FeedbackCategory::SafetyCheck,
+            Some("needs follow-up".to_string()),
+            Some("turn-123".to_string()),
+            /*include_logs*/ true,
+        );
+
+        assert_eq!(params.classification, "safety_check");
+        assert_eq!(params.reason, Some("needs follow-up".to_string()));
+        assert_eq!(params.thread_id, Some(thread_id.to_string()));
+        assert_eq!(
+            params
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("turn_id"))
+                .map(String::as_str),
+            Some("turn-123")
+        );
+        assert_eq!(params.include_logs, true);
+        assert_eq!(params.extra_log_files, Some(vec![rollout_path]));
+    }
+
+    #[test]
+    fn build_feedback_upload_params_omits_rollout_path_without_logs() {
+        let params = build_feedback_upload_params(
+            /*origin_thread_id*/ None,
+            Some(PathBuf::from("/tmp/rollout.jsonl")),
+            FeedbackCategory::GoodResult,
+            /*reason*/ None,
+            /*turn_id*/ None,
+            /*include_logs*/ false,
+        );
+
+        assert_eq!(params.classification, "good_result");
+        assert_eq!(params.reason, None);
+        assert_eq!(params.thread_id, None);
+        assert_eq!(params.tags, None);
+        assert_eq!(params.include_logs, false);
+        assert_eq!(params.extra_log_files, None);
+    }
 }

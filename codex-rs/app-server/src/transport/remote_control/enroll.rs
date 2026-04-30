@@ -2,6 +2,7 @@ use super::protocol::EnrollRemoteServerRequest;
 use super::protocol::EnrollRemoteServerResponse;
 use super::protocol::RemoteControlTarget;
 use axum::http::HeaderMap;
+use codex_api::SharedAuthProvider;
 use codex_login::default_client::build_reqwest_client;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
@@ -17,7 +18,6 @@ const REMOTE_CONTROL_RESPONSE_BODY_MAX_BYTES: usize = 4096;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
-const REMOTE_CONTROL_FEDRAMP_HEADER: &str = "X-OpenAI-Fedramp";
 pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,11 +28,9 @@ pub(super) struct RemoteControlEnrollment {
     pub(super) server_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RemoteControlConnectionAuth {
-    pub(super) authorization_header_value: String,
+    pub(super) auth_provider: SharedAuthProvider,
     pub(super) account_id: String,
-    pub(super) is_fedramp_account: bool,
 }
 
 pub(super) async fn load_persisted_remote_control_enrollment(
@@ -40,13 +38,15 @@ pub(super) async fn load_persisted_remote_control_enrollment(
     remote_control_target: &RemoteControlTarget,
     account_id: &str,
     app_server_client_name: Option<&str>,
-) -> Option<RemoteControlEnrollment> {
+) -> io::Result<Option<RemoteControlEnrollment>> {
     let Some(state_db) = state_db else {
-        info!(
-            "remote control enrollment cache unavailable because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}",
-            remote_control_target.websocket_url, account_id, app_server_client_name
-        );
-        return None;
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "remote control enrollment cache unavailable because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}",
+                remote_control_target.websocket_url, account_id, app_server_client_name
+            ),
+        ));
     };
     let enrollment = match state_db
         .get_remote_control_enrollment(
@@ -62,7 +62,7 @@ pub(super) async fn load_persisted_remote_control_enrollment(
                 "failed to load persisted remote control enrollment: websocket_url={}, account_id={}, app_server_client_name={:?}, err={err}",
                 remote_control_target.websocket_url, account_id, app_server_client_name
             );
-            return None;
+            return Err(io::Error::other(err));
         }
     };
 
@@ -76,19 +76,19 @@ pub(super) async fn load_persisted_remote_control_enrollment(
                 enrollment.server_id,
                 enrollment.environment_id
             );
-            Some(RemoteControlEnrollment {
+            Ok(Some(RemoteControlEnrollment {
                 account_id: enrollment.account_id,
                 environment_id: enrollment.environment_id,
                 server_id: enrollment.server_id,
                 server_name: enrollment.server_name,
-            })
+            }))
         }
         None => {
             info!(
                 "no persisted remote control enrollment found: websocket_url={}, account_id={}, app_server_client_name={:?}",
                 remote_control_target.websocket_url, account_id, app_server_client_name
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -101,14 +101,16 @@ pub(super) async fn update_persisted_remote_control_enrollment(
     enrollment: Option<&RemoteControlEnrollment>,
 ) -> io::Result<()> {
     let Some(state_db) = state_db else {
-        info!(
-            "skipping remote control enrollment persistence because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}, has_enrollment={}",
-            remote_control_target.websocket_url,
-            account_id,
-            app_server_client_name,
-            enrollment.is_some()
-        );
-        return Ok(());
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "remote control enrollment persistence unavailable because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}, has_enrollment={}",
+                remote_control_target.websocket_url,
+                account_id,
+                app_server_client_name,
+                enrollment.is_some()
+            ),
+        ));
     };
     if let &Some(enrollment) = &enrollment
         && enrollment.account_id != account_id
@@ -201,15 +203,14 @@ pub(super) async fn enroll_remote_control_server(
         app_server_version: env!("CARGO_PKG_VERSION"),
     };
     let client = build_reqwest_client();
-    let mut http_request = client
+    let mut auth_headers = HeaderMap::new();
+    auth.auth_provider.add_auth_headers(&mut auth_headers);
+    let http_request = client
         .post(enroll_url)
         .timeout(REMOTE_CONTROL_ENROLL_TIMEOUT)
-        .header("authorization", &auth.authorization_header_value)
-        .header(REMOTE_CONTROL_ACCOUNT_ID_HEADER, &auth.account_id);
-    if auth.is_fedramp_account {
-        http_request = http_request.header(REMOTE_CONTROL_FEDRAMP_HEADER, "true");
-    }
-    let http_request = http_request.json(&request);
+        .headers(auth_headers)
+        .header(REMOTE_CONTROL_ACCOUNT_ID_HEADER, &auth.account_id)
+        .json(&request);
 
     let response = http_request.send().await.map_err(|err| {
         io::Error::other(format!(
@@ -325,7 +326,8 @@ mod tests {
                 "account-a",
                 Some("desktop-client"),
             )
-            .await,
+            .await
+            .expect("first enrollment should load"),
             Some(first_enrollment.clone())
         );
         assert_eq!(
@@ -335,7 +337,8 @@ mod tests {
                 "account-b",
                 Some("desktop-client"),
             )
-            .await,
+            .await
+            .expect("missing account should load"),
             None
         );
         assert_eq!(
@@ -345,7 +348,8 @@ mod tests {
                 "account-a",
                 Some("desktop-client"),
             )
-            .await,
+            .await
+            .expect("second enrollment should load"),
             Some(second_enrollment)
         );
     }
@@ -408,7 +412,8 @@ mod tests {
                 "account-a",
                 /*app_server_client_name*/ None,
             )
-            .await,
+            .await
+            .expect("cleared enrollment should load"),
             None
         );
         assert_eq!(
@@ -418,7 +423,8 @@ mod tests {
                 "account-a",
                 /*app_server_client_name*/ None,
             )
-            .await,
+            .await
+            .expect("remaining enrollment should load"),
             Some(second_enrollment)
         );
     }
@@ -450,9 +456,8 @@ mod tests {
         let err = enroll_remote_control_server(
             &remote_control_target,
             &RemoteControlConnectionAuth {
-                authorization_header_value: "Bearer Access Token".to_string(),
+                auth_provider: codex_model_provider::unauthenticated_auth_provider(),
                 account_id: "account_id".to_string(),
-                is_fedramp_account: false,
             },
         )
         .await

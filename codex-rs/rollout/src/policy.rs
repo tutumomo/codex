@@ -16,10 +16,9 @@ pub fn is_persisted_response_item(item: &RolloutItem, mode: EventPersistenceMode
         RolloutItem::ResponseItem(item) => should_persist_response_item(item),
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev, mode),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
-        RolloutItem::Compacted(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::SessionMeta(_)
-        | RolloutItem::SessionState(_) => true,
+        RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {
+            true
+        }
     }
 }
 
@@ -38,7 +37,6 @@ pub fn should_persist_response_item(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::Other => false,
     }
@@ -59,7 +57,6 @@ pub fn should_persist_response_item_for_memories(item: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. } => true,
         ResponseItem::Reasoning { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::Other => false,
     }
@@ -133,17 +130,20 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_) => Some(EventPersistenceMode::Extended),
         EventMsg::Warning(_)
+        | EventMsg::GuardianWarning(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::ModelReroute(_)
+        | EventMsg::ModelVerification(_)
         | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
+        | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::WebSearchBegin(_)
         | EventMsg::ExecCommandBegin(_)
